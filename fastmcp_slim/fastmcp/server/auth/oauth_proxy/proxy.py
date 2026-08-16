@@ -345,6 +345,7 @@ class OAuthProxy(OAuthProvider, ConsentMixin):
         enable_cimd: bool = True,
         # Identity assertion (SEP-990 ID-JAG) support
         identity_assertion: IdentityAssertion | None = None,
+        identity_assertion_jti_store: AsyncKeyValue | None = None,
     ):
         """Initialize the OAuth proxy provider.
 
@@ -448,6 +449,12 @@ class OAuthProxy(OAuthProvider, ConsentMixin):
                 carrying an ID-JAG issued by one of the configured trusted issuers, and
                 mints a short-lived access token (no refresh token) for the asserted
                 subject. When omitted, the grant is rejected as unsupported.
+            identity_assertion_jti_store: Store backing ID-JAG jti replay protection.
+                If None, an in-process store is used, which does not share replay
+                state across horizontally-scaled workers or replicas. Pass a store
+                backed by Redis, Postgres, or another shared `AsyncKeyValue` backend
+                to make replay protection effective across a multi-replica
+                deployment. Has no effect when `identity_assertion` is not set.
         """
 
         default_scopes = valid_scopes or token_verifier.required_scopes
@@ -715,6 +722,7 @@ class OAuthProxy(OAuthProvider, ConsentMixin):
             self._identity_assertion_validator = IdentityAssertionValidator(
                 config=identity_assertion,
                 audience=str(self.issuer_url),
+                jti_store=identity_assertion_jti_store,
             )
         # ID-JAG access tokens are self-contained (no upstream token or JTI
         # mapping to delete), so revocation tracks their jtis here until the

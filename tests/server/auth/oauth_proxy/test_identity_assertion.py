@@ -12,6 +12,7 @@ import time
 import httpx2
 import pytest
 from joserfc import jwk, jwt
+from key_value.aio.protocols.key_value import AsyncKeyValue
 from key_value.aio.stores.memory import MemoryStore
 from mcp.shared.auth import OAuthClientInformationFull
 from pydantic import AnyUrl
@@ -101,7 +102,11 @@ def _mint_id_jag(
     return jwt.encode(header, payload, signing_key, algorithms=["RS256"])
 
 
-def _make_proxy(identity_assertion: IdentityAssertion | None) -> OAuthProxy:
+def _make_proxy(
+    identity_assertion: IdentityAssertion | None,
+    *,
+    identity_assertion_jti_store: AsyncKeyValue | None = None,
+) -> OAuthProxy:
     return OAuthProxy(
         upstream_authorization_endpoint="https://login.acme-corp.com/authorize",
         upstream_token_endpoint="https://login.acme-corp.com/token",
@@ -112,6 +117,7 @@ def _make_proxy(identity_assertion: IdentityAssertion | None) -> OAuthProxy:
         jwt_signing_key="test-signing-key",
         client_storage=MemoryStore(),
         identity_assertion=identity_assertion,
+        identity_assertion_jti_store=identity_assertion_jti_store,
     )
 
 
@@ -759,26 +765,63 @@ class TestValidationMatrix:
 
         assert resp.status_code == 200
 
-    async def test_jti_cache_does_not_grow_past_capacity(
+    async def test_capacity_bounded_store_evicts_oldest_jti(
         self, idp_key: RSAKeyPair, config: IdentityAssertion
     ):
-        # Once the JTI cache is full of still-valid entries, further fresh
-        # assertions are rejected as overloaded WITHOUT being inserted, so the
-        # cache never grows beyond its cap.
-        proxy = _make_proxy(config)
-        validator = proxy._identity_assertion_validator
-        assert validator is not None
-        validator._jti_cache_max_size = 2
-        future = time.time() + 120
-        validator._jti_cache = {"filler-a": future, "filler-b": future}
+        # Capacity handling is now a property of whichever store backs jti
+        # replay protection: a capacity-bounded store evicts the oldest entry
+        # under pressure rather than rejecting new-but-valid assertions.
+        proxy = _make_proxy(
+            config,
+            identity_assertion_jti_store=MemoryStore(max_entries_per_collection=2),
+        )
 
         for i in range(3):
             assertion = _mint_id_jag(idp_key, jti=f"fresh-{i}")
             resp = await _post_token(proxy, assertion)
-            assert resp.status_code == 401
-            assert resp.json()["error"] == "invalid_grant"
+            assert resp.status_code == 200
 
-        assert len(validator._jti_cache) == 2
+        # "fresh-0" was evicted to make room for "fresh-2", so it is no longer
+        # tracked as replayed and a second use is (silently) accepted again.
+        replay = _mint_id_jag(idp_key, jti="fresh-0")
+        resp = await _post_token(proxy, replay)
+        assert resp.status_code == 200
+
+    async def test_shared_jti_store_blocks_cross_replica_replay(
+        self, idp_key: RSAKeyPair, config: IdentityAssertion
+    ):
+        # Regression test for the reported gap: two validators standing in for
+        # two horizontally-scaled replicas, each with its own per-process
+        # cache, both accept the same assertion once -- defeating replay
+        # protection. Sharing one store across them closes that gap.
+        shared_store = MemoryStore()
+        replica_a = _make_proxy(config, identity_assertion_jti_store=shared_store)
+        replica_b = _make_proxy(config, identity_assertion_jti_store=shared_store)
+        assertion = _mint_id_jag(idp_key, jti="cross-replica")
+
+        first = await _post_token(replica_a, assertion)
+        second = await _post_token(replica_b, assertion)
+
+        assert first.status_code == 200
+        assert second.status_code == 401
+        assert second.json()["error"] == "invalid_grant"
+
+    async def test_default_store_does_not_share_replay_state(
+        self, idp_key: RSAKeyPair, config: IdentityAssertion
+    ):
+        # Documents the default (no jti_store passed): each validator gets its
+        # own in-process MemoryStore, so the same assertion is accepted once
+        # per instance -- the exact gap #4846 reports for the un-configured
+        # default.
+        replica_a = _make_proxy(config)
+        replica_b = _make_proxy(config)
+        assertion = _mint_id_jag(idp_key, jti="unshared")
+
+        first = await _post_token(replica_a, assertion)
+        second = await _post_token(replica_b, assertion)
+
+        assert first.status_code == 200
+        assert second.status_code == 200
 
 
 class TestAlgorithmConfig:

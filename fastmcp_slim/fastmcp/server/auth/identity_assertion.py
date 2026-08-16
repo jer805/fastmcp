@@ -32,6 +32,8 @@ from typing import TYPE_CHECKING
 from urllib.parse import urlparse, urlunparse
 
 import httpx2
+from key_value.aio.protocols.key_value import AsyncKeyValue
+from key_value.aio.stores.memory import MemoryStore
 from pydantic import BaseModel, Field, field_validator
 
 from fastmcp.utilities.auth import decode_jwt_header
@@ -41,6 +43,13 @@ if TYPE_CHECKING:
     from fastmcp.server.auth.providers.jwt import JWTVerifier
 
 logger = get_logger(__name__)
+
+#: Collection name for jti replay entries within a shared `AsyncKeyValue` store.
+JTI_COLLECTION = "identity-assertion-jti"
+
+#: Default in-process cap on tracked jtis when no store is configured, matching
+#: the previous hardcoded cache size.
+DEFAULT_MAX_JTI_ENTRIES = 10000
 
 #: RFC 7523 §2.1 authorization grant used to present the ID-JAG.
 JWT_BEARER_GRANT_TYPE = "urn:ietf:params:oauth:grant-type:jwt-bearer"
@@ -196,11 +205,24 @@ class IdentityAssertionValidator:
     that the generic verifier does not cover: the ``typ`` JOSE header, a mandatory
     ``sub``, and ``jti`` replay rejection.
 
-    JTI replay protection mirrors :class:`CIMDAssertionValidator`: seen ``jti``
-    values are cached until the assertion would expire anyway, with periodic
-    cleanup and an emergency size cap. Like CIMD, the cache is per-process, so
-    replay protection is not shared across horizontally-scaled workers or
-    replicas; see the identity-assertion docs for the deployment caveat.
+    JTI replay protection is backed by a pluggable :class:`AsyncKeyValue` store
+    (the same interface :class:`~fastmcp.server.middleware.caching.ResponseCachingMiddleware`
+    accepts as ``cache_storage``): seen ``jti`` values are recorded there until the
+    assertion would expire anyway. The default store is an in-process
+    :class:`~key_value.aio.stores.memory.MemoryStore`, which is per-process like
+    CIMD's ``private_key_jwt`` replay protection — so replay protection is not
+    shared across horizontally-scaled workers or replicas unless a shared store
+    (Redis, Postgres, etc.) is passed via ``jti_store``; see the identity-assertion
+    docs for the deployment caveat.
+
+    Note that the burn is a TTL-checked read followed by a write, not an atomic
+    set-if-absent — `AsyncKeyValue` has no such primitive today. This closes the
+    cross-replica gap for all practical purposes, but two requests carrying the
+    same jti that arrive genuinely concurrently against a network-backed store
+    could both be admitted in the narrow window between the read and the write.
+    A backend that enforces uniqueness itself (e.g. a Redis store configured to
+    use `SET NX`, or a Postgres store with a unique constraint on the key) closes
+    that window entirely.
     """
 
     #: RFC 7523 recommends short-lived assertions; reject anything longer.
@@ -208,13 +230,23 @@ class IdentityAssertionValidator:
     #: Clock-skew tolerance for exp/iat checks.
     CLOCK_SKEW_SECONDS = 30
 
-    def __init__(self, config: IdentityAssertion, audience: str):
+    def __init__(
+        self,
+        config: IdentityAssertion,
+        audience: str,
+        jti_store: AsyncKeyValue | None = None,
+    ):
         """Initialize the validator.
 
         Args:
             config: The identity assertion configuration.
             audience: The authorization server's own issuer URL; the ID-JAG's `aud`
                 must match this unless `config.audience` overrides it.
+            jti_store: Store backing jti replay protection. Defaults to an
+                in-process `MemoryStore`, which does not share state across
+                replicas. Pass a store backed by Redis, Postgres, or another
+                shared backend to make replay protection effective across a
+                horizontally-scaled deployment.
         """
         self.config = config
         # Accept the audience both with and without a trailing slash: metadata
@@ -227,10 +259,9 @@ class IdentityAssertionValidator:
             base = audience.rstrip("/")
             self.audience = [base, base + "/"]
 
-        self._jti_cache: dict[str, float] = {}
-        self._jti_cache_max_size = 10000
-        self._last_cleanup = time.monotonic()
-        self._cleanup_interval = 60
+        self._jti_store: AsyncKeyValue = jti_store or MemoryStore(
+            max_entries_per_collection=DEFAULT_MAX_JTI_ENTRIES
+        )
         # One JWTVerifier per issuer, created lazily once the JWKS URI is known.
         self._verifiers: dict[str, JWTVerifier] = {}
         # OIDC discovery hardening: discovery runs before signature verification,
@@ -240,20 +271,6 @@ class IdentityAssertionValidator:
         self._discovery_locks: dict[str, asyncio.Lock] = {}
         self._discovery_failures: dict[str, float] = {}
         self._discovery_failure_cooldown = 30.0
-
-    def _cleanup_expired_jtis(self) -> None:
-        now = time.time()
-        expired = [jti for jti, exp in self._jti_cache.items() if exp < now]
-        for jti in expired:
-            del self._jti_cache[jti]
-        if expired:
-            logger.debug("Cleaned up %d expired ID-JAG jtis from cache", len(expired))
-
-    def _maybe_cleanup(self) -> None:
-        now = time.monotonic()
-        if now - self._last_cleanup > self._cleanup_interval:
-            self._cleanup_expired_jtis()
-            self._last_cleanup = now
 
     async def _discover_jwks_uri(self, issuer: str) -> str:
         """Discover an issuer's JWKS URI via OIDC discovery.
@@ -345,8 +362,6 @@ class IdentityAssertionValidator:
         Raises:
             IdentityAssertionError: If the assertion is invalid for any reason.
         """
-        self._maybe_cleanup()
-
         # 1. typ header MUST be oauth-id-jag+jwt (SEP-990 §5.1).
         try:
             header = decode_jwt_header(assertion)
@@ -445,27 +460,21 @@ class IdentityAssertionValidator:
                 )
 
         # 7. jti replay rejection (RFC 7523 §3). Must be a non-empty string —
-        # an array/object jti is unhashable and would raise TypeError on the
-        # cache lookup (a 500) instead of a clean invalid_grant.
+        # an array/object jti is unhashable as a dict key and, more importantly,
+        # is not a valid AsyncKeyValue key.
         jti = claims.get("jti")
         if not jti or not isinstance(jti, str):
             raise IdentityAssertionError("Assertion must include a string jti claim")
-        cached_exp = self._jti_cache.get(jti)
-        if cached_exp is not None and cached_exp > now:
+
+        existing, _ttl = await self._jti_store.ttl(jti, collection=JTI_COLLECTION)
+        if existing is not None:
             raise IdentityAssertionError(f"Assertion replay detected: jti {jti} reused")
 
-        # Enforce the cap BEFORE inserting so a rejected assertion never grows the
-        # cache. A fresh jti that would exceed capacity is rejected outright (after
-        # a cleanup pass to reclaim any expired entries first).
-        if (
-            jti not in self._jti_cache
-            and len(self._jti_cache) >= self._jti_cache_max_size
-        ):
-            self._cleanup_expired_jtis()
-            if len(self._jti_cache) >= self._jti_cache_max_size:
-                logger.warning("ID-JAG jti cache at capacity, possible attack")
-                raise IdentityAssertionError("Server overloaded, please retry")
-        self._jti_cache[jti] = exp
+        # Burn the jti for the remaining lifetime of the assertion — no need to
+        # track it past the point the assertion would be rejected on exp alone.
+        await self._jti_store.put(
+            jti, {"exp": exp}, collection=JTI_COLLECTION, ttl=max(exp - now, 0.0)
+        )
 
         logger.debug("ID-JAG validated for subject=%s issuer=%s", sub, iss)
         return claims
