@@ -12,7 +12,7 @@ import time
 import httpx2
 import pytest
 from joserfc import jwk, jwt
-from key_value.aio.protocols.key_value import AsyncKeyValue
+from key_value.aio.protocols import AsyncKeyValue
 from key_value.aio.stores.memory import MemoryStore
 from mcp.shared.auth import OAuthClientInformationFull
 from pydantic import AnyUrl
@@ -105,6 +105,7 @@ def _mint_id_jag(
 def _make_proxy(
     identity_assertion: IdentityAssertion | None,
     *,
+    client_storage: AsyncKeyValue | None = None,
     identity_assertion_jti_store: AsyncKeyValue | None = None,
 ) -> OAuthProxy:
     return OAuthProxy(
@@ -115,7 +116,7 @@ def _make_proxy(
         token_verifier=MockTokenVerifier(),
         base_url=BASE_URL,
         jwt_signing_key="test-signing-key",
-        client_storage=MemoryStore(),
+        client_storage=client_storage or MemoryStore(),
         identity_assertion=identity_assertion,
         identity_assertion_jti_store=identity_assertion_jti_store,
     )
@@ -787,16 +788,15 @@ class TestValidationMatrix:
         resp = await _post_token(proxy, replay)
         assert resp.status_code == 200
 
-    async def test_shared_jti_store_blocks_cross_replica_replay(
+    async def test_shared_client_storage_blocks_cross_replica_replay(
         self, idp_key: RSAKeyPair, config: IdentityAssertion
     ):
-        # Regression test for the reported gap: two validators standing in for
-        # two horizontally-scaled replicas, each with its own per-process
-        # cache, both accept the same assertion once -- defeating replay
-        # protection. Sharing one store across them closes that gap.
-        shared_store = MemoryStore()
-        replica_a = _make_proxy(config, identity_assertion_jti_store=shared_store)
-        replica_b = _make_proxy(config, identity_assertion_jti_store=shared_store)
+        # Regression test for the reported gap: two replicas that share a
+        # client_storage backend (as any multi-replica deployment must) reject
+        # the second use of an assertion, with no replay-specific config.
+        shared_storage = MemoryStore()
+        replica_a = _make_proxy(config, client_storage=shared_storage)
+        replica_b = _make_proxy(config, client_storage=shared_storage)
         assertion = _mint_id_jag(idp_key, jti="cross-replica")
 
         first = await _post_token(replica_a, assertion)
@@ -806,13 +806,11 @@ class TestValidationMatrix:
         assert second.status_code == 401
         assert second.json()["error"] == "invalid_grant"
 
-    async def test_default_store_does_not_share_replay_state(
+    async def test_unshared_storage_does_not_share_replay_state(
         self, idp_key: RSAKeyPair, config: IdentityAssertion
     ):
-        # Documents the default (no jti_store passed): each validator gets its
-        # own in-process MemoryStore, so the same assertion is accepted once
-        # per instance -- the exact gap #4846 reports for the un-configured
-        # default.
+        # Documents the remaining caveat: replicas that each keep their own
+        # storage accept the same assertion once apiece.
         replica_a = _make_proxy(config)
         replica_b = _make_proxy(config)
         assertion = _mint_id_jag(idp_key, jti="unshared")

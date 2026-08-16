@@ -32,7 +32,8 @@ from typing import TYPE_CHECKING
 from urllib.parse import urlparse, urlunparse
 
 import httpx2
-from key_value.aio.protocols.key_value import AsyncKeyValue
+from key_value.aio.adapters.pydantic import PydanticAdapter
+from key_value.aio.protocols import AsyncKeyValue
 from key_value.aio.stores.memory import MemoryStore
 from pydantic import BaseModel, Field, field_validator
 
@@ -44,11 +45,8 @@ if TYPE_CHECKING:
 
 logger = get_logger(__name__)
 
-#: Collection name for jti replay entries within a shared `AsyncKeyValue` store.
-JTI_COLLECTION = "identity-assertion-jti"
-
-#: Default in-process cap on tracked jtis when no store is configured, matching
-#: the previous hardcoded cache size.
+#: Cap on tracked jtis for the fallback in-process store, matching the size the
+#: previous hardcoded cache used.
 DEFAULT_MAX_JTI_ENTRIES = 10000
 
 #: RFC 7523 §2.1 authorization grant used to present the ID-JAG.
@@ -189,6 +187,16 @@ class IdentityAssertion(BaseModel):
         return v
 
 
+class ConsumedJTI(BaseModel):
+    """A jti that has been consumed by a successful ID-JAG exchange.
+
+    Stored until the assertion carrying it would expire on its own, at which
+    point replaying it fails the `exp` check regardless.
+    """
+
+    exp: float  # Unix timestamp the originating assertion expires at
+
+
 class IdentityAssertionError(Exception):
     """Raised when an ID-JAG fails validation.
 
@@ -205,24 +213,21 @@ class IdentityAssertionValidator:
     that the generic verifier does not cover: the ``typ`` JOSE header, a mandatory
     ``sub``, and ``jti`` replay rejection.
 
-    JTI replay protection is backed by a pluggable :class:`AsyncKeyValue` store
-    (the same interface :class:`~fastmcp.server.middleware.caching.ResponseCachingMiddleware`
-    accepts as ``cache_storage``): seen ``jti`` values are recorded there until the
-    assertion would expire anyway. The default store is an in-process
-    :class:`~key_value.aio.stores.memory.MemoryStore`, which is per-process like
-    CIMD's ``private_key_jwt`` replay protection — so replay protection is not
-    shared across horizontally-scaled workers or replicas unless a shared store
-    (Redis, Postgres, etc.) is passed via ``jti_store``; see the identity-assertion
-    docs for the deployment caveat.
+    Consumed ``jti`` values are recorded in an `AsyncKeyValue` store until the
+    assertion carrying them would expire anyway. ``OAuthProxy`` backs this with
+    the same ``client_storage`` that holds the rest of its state, so a deployment
+    that already points ``client_storage`` at Redis (or any other shared backend)
+    gets replay protection across every replica without additional configuration.
+    A validator constructed directly, without a ``jti_store``, falls back to an
+    in-process store and is therefore per-process — replay protection is not
+    shared across horizontally-scaled workers in that case.
 
     Note that the burn is a TTL-checked read followed by a write, not an atomic
-    set-if-absent — `AsyncKeyValue` has no such primitive today. This closes the
-    cross-replica gap for all practical purposes, but two requests carrying the
-    same jti that arrive genuinely concurrently against a network-backed store
-    could both be admitted in the narrow window between the read and the write.
-    A backend that enforces uniqueness itself (e.g. a Redis store configured to
-    use `SET NX`, or a Postgres store with a unique constraint on the key) closes
-    that window entirely.
+    set-if-absent: `AsyncKeyValue` exposes no such primitive, so no backend can
+    currently provide one through this interface. Two requests carrying the same
+    jti that arrive genuinely concurrently can therefore both be admitted in the
+    narrow window between the read and the write. Closing that window entirely
+    requires a set-if-absent primitive on the store protocol itself.
     """
 
     #: RFC 7523 recommends short-lived assertions; reject anything longer.
@@ -242,11 +247,10 @@ class IdentityAssertionValidator:
             config: The identity assertion configuration.
             audience: The authorization server's own issuer URL; the ID-JAG's `aud`
                 must match this unless `config.audience` overrides it.
-            jti_store: Store backing jti replay protection. Defaults to an
-                in-process `MemoryStore`, which does not share state across
-                replicas. Pass a store backed by Redis, Postgres, or another
-                shared backend to make replay protection effective across a
-                horizontally-scaled deployment.
+            jti_store: Storage backend for consumed jtis. `OAuthProxy` passes its
+                `client_storage`, so replay state is shared wherever the rest of
+                the proxy's state is. Defaults to an in-process store, which does
+                not share state across replicas.
         """
         self.config = config
         # Accept the audience both with and without a trailing slash: metadata
@@ -259,8 +263,12 @@ class IdentityAssertionValidator:
             base = audience.rstrip("/")
             self.audience = [base, base + "/"]
 
-        self._jti_store: AsyncKeyValue = jti_store or MemoryStore(
-            max_entries_per_collection=DEFAULT_MAX_JTI_ENTRIES
+        self._jti_store: PydanticAdapter[ConsumedJTI] = PydanticAdapter[ConsumedJTI](
+            key_value=jti_store
+            or MemoryStore(max_entries_per_collection=DEFAULT_MAX_JTI_ENTRIES),
+            pydantic_model=ConsumedJTI,
+            default_collection="mcp-id-jag-jtis",
+            raise_on_validation_error=True,
         )
         # One JWTVerifier per issuer, created lazily once the JWKS URI is known.
         self._verifiers: dict[str, JWTVerifier] = {}
@@ -466,14 +474,13 @@ class IdentityAssertionValidator:
         if not jti or not isinstance(jti, str):
             raise IdentityAssertionError("Assertion must include a string jti claim")
 
-        existing, _ttl = await self._jti_store.ttl(jti, collection=JTI_COLLECTION)
-        if existing is not None:
+        if await self._jti_store.get(key=jti) is not None:
             raise IdentityAssertionError(f"Assertion replay detected: jti {jti} reused")
 
         # Burn the jti for the remaining lifetime of the assertion — no need to
         # track it past the point the assertion would be rejected on exp alone.
         await self._jti_store.put(
-            jti, {"exp": exp}, collection=JTI_COLLECTION, ttl=max(exp - now, 0.0)
+            key=jti, value=ConsumedJTI(exp=exp), ttl=max(exp - now, 0.0)
         )
 
         logger.debug("ID-JAG validated for subject=%s issuer=%s", sub, iss)

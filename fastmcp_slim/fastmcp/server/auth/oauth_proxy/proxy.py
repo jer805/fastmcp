@@ -449,12 +449,12 @@ class OAuthProxy(OAuthProvider, ConsentMixin):
                 carrying an ID-JAG issued by one of the configured trusted issuers, and
                 mints a short-lived access token (no refresh token) for the asserted
                 subject. When omitted, the grant is rejected as unsupported.
-            identity_assertion_jti_store: Store backing ID-JAG jti replay protection.
-                If None, an in-process store is used, which does not share replay
-                state across horizontally-scaled workers or replicas. Pass a store
-                backed by Redis, Postgres, or another shared `AsyncKeyValue` backend
-                to make replay protection effective across a multi-replica
-                deployment. Has no effect when `identity_assertion` is not set.
+            identity_assertion_jti_store: Optional override for where consumed ID-JAG
+                jtis are recorded. Defaults to `client_storage`, so replay protection
+                is shared across replicas whenever that is (as it must be in any
+                multi-replica deployment). Set this only to isolate high-churn replay
+                state from the rest of the proxy's storage. Has no effect when
+                `identity_assertion` is not set.
         """
 
         default_scopes = valid_scopes or token_verifier.required_scopes
@@ -719,10 +719,13 @@ class OAuthProxy(OAuthProvider, ConsentMixin):
         self._identity_assertion: IdentityAssertion | None = identity_assertion
         self._identity_assertion_validator: IdentityAssertionValidator | None = None
         if identity_assertion is not None:
+            # Replay state rides on client_storage like every other piece of
+            # proxy state, so pointing that at a shared backend is all a
+            # multi-replica deployment needs for cross-replica replay rejection.
             self._identity_assertion_validator = IdentityAssertionValidator(
                 config=identity_assertion,
                 audience=str(self.issuer_url),
-                jti_store=identity_assertion_jti_store,
+                jti_store=identity_assertion_jti_store or self._client_storage,
             )
         # ID-JAG access tokens are self-contained (no upstream token or JTI
         # mapping to delete), so revocation tracks their jtis here until the

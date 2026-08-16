@@ -758,20 +758,26 @@ identity_assertion=IdentityAssertion(
 
 The subject asserted in the ID-JAG flows into the normal FastMCP auth context. Tools read it through `get_access_token()` exactly as they would for any other token, because the proxy issues the access token through its own token factory.
 
-<Warning>
-By default, replay protection is per-process: each server process tracks seen `jti` values in an in-memory store, so a horizontally-scaled deployment running multiple workers or replicas could accept the same assertion once per process. Pass a shared store — Redis, Postgres, or any other `AsyncKeyValue`-compatible backend — via `identity_assertion_jti_store` to share replay state across replicas:
+Consumed `jti` values are recorded in `client_storage`, alongside the rest of the proxy's state. A deployment that already points `client_storage` at a shared backend gets replay protection across every replica with no additional configuration:
 
 ```python
 from key_value.aio.stores.redis import RedisStore
 
+storage = RedisStore(url="redis://localhost:6379/0")
+
 proxy = OAuthProxy(
     ...,
-    identity_assertion=IdentityAssertion(trusted_issuers=[...]),
-    identity_assertion_jti_store=RedisStore(url="redis://localhost:6379/0"),
+    client_storage=storage,
+    identity_assertion=IdentityAssertion(trusted_issuers=[ISSUER]),
 )
 ```
 
-This closes the cross-replica gap for practical purposes, though the underlying check is a TTL-checked read followed by a write rather than an atomic set-if-absent, so a backend that itself enforces key uniqueness (e.g. Redis `SET NX`) gives the strongest guarantee. Revocation of ID-JAG access tokens is a separate, still per-process mechanism: they are self-contained, so revocation is tracked in-process until the token's (short, 5-minute default) natural expiry. For deployments that require strict revocation enforcement across replicas, configure sticky routing so a given client's requests reach the same process. This mirrors the posture of CIMD `private_key_jwt` replay protection, which is also per-process.
+To keep high-churn replay state off the store holding client registrations and tokens, point it somewhere else with `identity_assertion_jti_store`.
+
+<Warning>
+The replay check is a read followed by a write, not an atomic set-if-absent — the underlying key-value interface exposes no such primitive — so two requests carrying the same assertion that arrive genuinely concurrently can both be admitted. The window is narrow, but it is not zero.
+
+Leaving `client_storage` at its default means replay state is per-process, and a deployment running multiple workers or replicas will accept the same assertion once per process. Revocation of ID-JAG access tokens is per-process regardless: those tokens are self-contained, so revocation is tracked in memory until the token's (short, 5-minute default) natural expiry. For strict revocation enforcement across replicas, configure sticky routing so a given client's requests reach the same process. CIMD `private_key_jwt` replay protection remains per-process as well.
 </Warning>
 
 ## Security
